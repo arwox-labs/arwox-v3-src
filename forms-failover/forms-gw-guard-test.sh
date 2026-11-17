@@ -9,7 +9,7 @@ REAL_DATE="$(command -v date)"
 SWITCH="$SCRIPT_DIR/forms-fallback-switch.sh"
 DNS_SWITCH="$SCRIPT_DIR/dns-switch.sh"
 
-tmp=$(mktemp -d /tmp/forms-gw-guard-test.XXXXXX)
+tmp=$(mktemp -d "$SCRIPT_DIR/.forms-gw-guard-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/state"
 
@@ -30,6 +30,7 @@ cat > "$tmp/bin/curl" <<'EOF'
 url=""
 out_file=""
 use_k=""
+config=""
 text=""
 header=""
 input=""
@@ -56,6 +57,7 @@ if [ -n "$use_resolve" ] && [[ "$url" = https://* ]] && [ "$(cat "$GUARD_TEST_TM
 fi
 if [ -n "$use_k" ]; then
   while IFS= read -r line; do
+    config+="$line"$'\n'
     case "$line" in
       url\ =\ *)
         [ -n "$url" ] || { url="${line#url = }"; url="${url#\"}"; url="${url%\"}"; };;
@@ -114,6 +116,7 @@ case "$url" in
     printf '%s' "$status"
     ;;
   *sendMessage*)
+    printf '%s' "$config" >> "$GUARD_TEST_TMP/sent.config"
     printf '%s\n' "$text" >> "$GUARD_TEST_TMP/sent.log"
     printf '{"ok":true}\n'
     ;;
@@ -126,7 +129,7 @@ case "$url" in
     ;;
   *billingAccounts*)
     if [ -f "$GUARD_TEST_TMP/billing.fail" ]; then exit 1; fi
-    printf '{"billingAccounts":[{"active":true,"balance":"%s"}]}\n' "$(cat "$GUARD_TEST_TMP/balance")"
+    printf '{"billingAccounts":[{"id":"%s","active":true,"balance":"%s"}]}\n' "$(cat "$GUARD_TEST_TMP/billing.id" 2>/dev/null || echo fixtureaccount)" "$(cat "$GUARD_TEST_TMP/balance")"
     ;;
   https://storage.yandexcloud.net/*|https://ya.ru/*)
     printf '%s\n' "$(cat "$GUARD_TEST_TMP/net.code" 2>/dev/null || echo 200)"
@@ -156,6 +159,13 @@ cat > "$tmp/bin/yc" <<'EOF'
 # Test stub for yc. Scenarios are driven by files in $GUARD_TEST_TMP.
 if [ -f "$GUARD_TEST_TMP/yc-hang" ]; then sleep 30; fi
 case "$*" in
+  *"billing consumption-core get-resource-usage-report"*)
+    printf '%s\n' "$*" >> "$GUARD_TEST_TMP/usage.calls"
+    rc=$(cat "$GUARD_TEST_TMP/usage.rc" 2>/dev/null || echo 0)
+    [ "$rc" = 0 ] || exit "$rc"
+    [ ! -s "$GUARD_TEST_TMP/usage.hang" ] || sleep 3
+    cat "$GUARD_TEST_TMP/usage.json"
+    ;;
   "iam create-token"*)
     if [ -f "$GUARD_TEST_TMP/iam.fail" ]; then
       printf 'IAM error\n' >&2
@@ -1218,13 +1228,73 @@ case68() { # no outage before: successful cloud read sends no recovered message
   [ -s "$tmp/yc-logging.calls" ] && ! sent_has 'снова читается'
 }
 
-for i in {1..68}; do
+cost_setup() {
+  ext_setup
+  printf '5.1\n' > "$tmp/balance"
+  printf '{}\n' > "$tmp/state/state.json"
+  printf 'fixtureaccount' > "$tmp/billing.id"
+  printf 0 > "$tmp/usage.rc"
+  : > "$tmp/usage.hang"; : > "$tmp/usage.calls"; : > "$tmp/sent.log"; : > "$tmp/sent.config"
+  printf '%s\n' '{"currency":"RUB","expense":{"value":"10"},"entities_data":[{"resource":{"id":"alpha"},"expense":{"value":"6"}},{"resource":{"id":"beta"},"expense":{"value":"2"}},{"resource":{"id":"small"},"expense":{"value":"1"}},{"resource":{"id":"omitted"},"expense":{"value":"0.5"}},{"resource":{},"expense":{"value":"0.5"}}]}' > "$tmp/usage.json"
+}
+
+case69() { # Measured totals, unassigned costs, remainder, day and throttling.
+  cost_setup
+  run_guard; run_guard
+  grep -q '1970-01-01.*МСК.*10 RUB' "$tmp/sent.log" &&
+    grep -q 'alpha: 6 RUB.*beta: 2 RUB.*small: 1 RUB' "$tmp/sent.log" &&
+    grep -q 'Без ресурса: 0.5 RUB.*Остальное: 0.5 RUB' "$tmp/sent.log" &&
+    [ "$(wc -l < "$tmp/usage.calls")" = 1 ] &&
+    grep -q -- '--retry 0.*--start-date 1970-01-01T00:00:00+03:00.*--end-date 1970-01-01T23:59:59+03:00' "$tmp/usage.calls"
+}
+
+case70() { # Failure modes retain the base warning; the timeout is real.
+  local scenario
+  for scenario in denied malformed empty currency amount mismatch timeout; do
+    cost_setup
+    case "$scenario" in
+      denied) printf 7 > "$tmp/usage.rc" ;;
+      malformed) printf broken > "$tmp/usage.json" ;;
+      empty) printf '{}' > "$tmp/usage.json" ;;
+      currency) jq '.currency="RUB\nurl=bad"' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
+      amount) jq '.expense.value="NaN"' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
+      mismatch) jq '.expense.value="20"' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
+      timeout) printf 1 > "$tmp/usage.hang" ;;
+    esac
+    GUARD_YC_TIMEOUT=1 run_guard
+    grep -q 'Баланс Yandex Cloud.*Детализация расходов недоступна' "$tmp/sent.log" || return 1
+  done
+}
+
+case71() { # Missing account and disabled Telegram never request usage.
+  cost_setup; : > "$tmp/billing.id"
+  run_guard
+  grep -q 'Детализация расходов недоступна' "$tmp/sent.log" && [ ! -s "$tmp/usage.calls" ] || return 1
+  cost_setup
+  (unset TG_CHAT_ID; run_guard)
+  [ ! -s "$tmp/usage.calls" ] && [ ! -s "$tmp/sent.log" ]
+}
+
+case72() { # Currency is preserved; hostile identifiers cannot inject curl configuration.
+  cost_setup
+  jq '.currency="USD" | .entities_data[0].resource.id=(("evil\"\\\nurl = bad" * 200))' "$tmp/usage.json" > "$tmp/changed.json"
+  cp "$tmp/changed.json" "$tmp/usage.json"
+  run_guard
+  grep -q '10 USD' "$tmp/sent.log" && ! grep -q '10 RUB' "$tmp/sent.log" &&
+    [ "$(grep -c '^url = ' "$tmp/sent.config")" = 1 ] &&
+    [ "$(grep -c '^data-urlencode = ' "$tmp/sent.config")" = 1 ] &&
+    [ "$(wc -m < "$tmp/sent.log")" -lt 1801 ] &&
+    ! grep -Fq '\' "$tmp/sent.log" && ! grep -Fq '"' "$tmp/sent.log"
+}
+
+cases=("$@"); [ "${#cases[@]}" -gt 0 ] || cases=({1..72})
+for i in "${cases[@]}"; do
   if "case$i"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL case %s\n' "$i"; fi
 done
 if [ "$FAIL" = 0 ]; then
-  printf 'PASS %d/68\n' "$PASS"
+  printf 'PASS %d/%d\n' "$PASS" "${#cases[@]}"
   exit 0
 else
-  printf 'FAIL %d/68 (PASS %d/68)\n' "$FAIL" "$PASS"
+  printf 'FAIL %d/%d (PASS %d/%d)\n' "$FAIL" "${#cases[@]}" "$PASS" "${#cases[@]}"
   exit 1
 fi
