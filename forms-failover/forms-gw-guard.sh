@@ -127,6 +127,44 @@ notify() { # type text
     log "telegram skipped $type"
     return 0
   fi
+  if [ "$type" = low_balance ]; then
+    local account="${3:-}" day period report detail=""
+    day=$(TZ=Europe/Moscow date -d "@$((now - 86400))" +%F)
+    period=$(date -u -d "${day}T00:00:00+03:00" +%FT%TZ)
+    if [[ "$account" =~ ^[a-zA-Z0-9]+$ ]] &&
+       report=$(timeout "$GUARD_YC_TIMEOUT" yc --profile "${YC_PROFILE:-default}" --retry 0 \
+         billing consumption-core get-resource-usage-report "$account" \
+         --start-date "${day}T00:00:00+03:00" --end-date "${day}T23:59:59+03:00" \
+         --aggregation-period day --format json 2>/dev/null); then
+      detail=$(printf '%s' "$report" | jq -er --arg day "$day" --arg period "$period" '
+        def amount:
+          (if type == "number" then .
+           elif type == "string" and test("^-?[0-9]+(\\.[0-9]+)?$") then tonumber
+           else error("invalid amount") end)
+          | if isfinite then . else error("nonfinite amount") end;
+        if (.currency | type == "string" and test("^[A-Z]{3}$")) and
+           (.entities_data | type == "array" and length > 0) then .
+        else error("invalid report") end
+        | if all(.entities_data[]; (.periodic | type == "array" and length > 0) and
+                 all(.periodic[]; .timestamp == $period)) then . else error("unexpected period") end
+        | .currency as $currency | (.expense.value | amount) as $total
+        | [.entities_data[] | {id:(.resource.id // ""), value:(.expense.value | amount)}
+           | if (.id | type == "string") then . else error("invalid resource") end]
+        | group_by(.id) | map({id:.[0].id, value:(map(.value) | add)}) as $rows
+        | if (($rows | map(.value) | add) - $total | fabs) <= 0.000001 then .
+          else error("inconsistent total") end
+        | (($rows | map(select(.id != "")) | sort_by(-.value) | .[:3]) +
+           ($rows | map(select(.id == ""))))
+        | map(. + {cents:(.value * 100 | round)}) as $shown
+        | ($total * 100 | round) as $cents
+        | "Расходы за \($day) (МСК, предварительно): \($cents / 100) \($currency); " +
+          ($shown | map("\(if .id == "" then "Без ресурса" else (.id | gsub("[[:cntrl:]\"\\\\]"; " ") | .[:80]) end): \(.cents / 100) \($currency)") | join("; ")) +
+          "; Остальное: \(($cents - ($shown | map(.cents) | add // 0)) / 100) \($currency)"
+      ' 2>/dev/null) || detail=""
+    fi
+    msg="$msg ${detail:-Детализация расходов недоступна.}"
+    msg=$(printf '%s' "$msg" | jq -Rrs 'gsub("[[:cntrl:]\"\\\\]"; " ") | .[:1800]')
+  fi
   if [ -f "$GUARD_DRILL_STATE" ]; then msg="УЧЕНИЯ: $msg"; fi
   if out=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
       "$TG_BOT_TOKEN" "$TG_CHAT_ID" "$msg" | curl -s --max-time 10 -K - 2>&1) && \
@@ -141,6 +179,7 @@ notify() { # type text
       *) echo "$state" | jq --arg t "$type" --argjson n "$now" '.[$t] = $n' | state_write ;;
     esac
     log "sent $type"
+    if [ "$type" = low_balance ]; then log "balance detail: ${detail:-unavailable}"; fi
   else
     log "send failed $type"
   fi
@@ -544,7 +583,7 @@ else
     balance=$(printf '%s' "$resp" | jq -r '.billingAccounts[0].balance' 2>/dev/null)
     log "balance $balance active=$active"
     if [ "$active" = "true" ] && awk -v b="$balance" -v m="$GUARD_BALANCE_MIN" 'BEGIN{exit !(b+0<m+0)}'; then
-      notify low_balance "$balance"
+      notify low_balance "$balance" "$(printf '%s' "$resp" | jq -r '.billingAccounts[0].id // empty' 2>/dev/null)"
     fi
     if [ -f "$STATE_FILE" ]; then
       jq -c --arg a "$active" --arg b "$balance" '.last_iam_ok = true | .last_active = $a | .last_balance = $b' \
