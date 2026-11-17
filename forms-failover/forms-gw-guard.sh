@@ -128,14 +128,15 @@ notify() { # type text
     return 0
   fi
   if [ "$type" = low_balance ]; then
-    local account="${3:-}" day report detail=""
+    local account="${3:-}" day period report detail=""
     day=$(TZ=Europe/Moscow date -d "@$((now - 86400))" +%F)
+    period=$(date -u -d "${day}T00:00:00+03:00" +%FT%TZ)
     if [[ "$account" =~ ^[a-zA-Z0-9]+$ ]] &&
        report=$(timeout "$GUARD_YC_TIMEOUT" yc --profile "${YC_PROFILE:-default}" --retry 0 \
          billing consumption-core get-resource-usage-report "$account" \
          --start-date "${day}T00:00:00+03:00" --end-date "${day}T23:59:59+03:00" \
          --aggregation-period day --format json 2>/dev/null); then
-      detail=$(printf '%s' "$report" | jq -er --arg day "$day" '
+      detail=$(printf '%s' "$report" | jq -er --arg day "$day" --arg period "$period" '
         def amount:
           (if type == "number" then .
            elif type == "string" and test("^-?[0-9]+(\\.[0-9]+)?$") then tonumber
@@ -144,6 +145,8 @@ notify() { # type text
         if (.currency | type == "string" and test("^[A-Z]{3}$")) and
            (.entities_data | type == "array" and length > 0) then .
         else error("invalid report") end
+        | if all(.entities_data[]; (.periodic | type == "array" and length > 0) and
+                 all(.periodic[]; .timestamp == $period)) then . else error("unexpected period") end
         | .currency as $currency | (.expense.value | amount) as $total
         | [.entities_data[] | {id:(.resource.id // ""), value:(.expense.value | amount)}
            | if (.id | type == "string") then . else error("invalid resource") end]
@@ -176,6 +179,7 @@ notify() { # type text
       *) echo "$state" | jq --arg t "$type" --argjson n "$now" '.[$t] = $n' | state_write ;;
     esac
     log "sent $type"
+    if [ "$type" = low_balance ]; then log "balance detail: ${detail:-unavailable}"; fi
   else
     log "send failed $type"
   fi

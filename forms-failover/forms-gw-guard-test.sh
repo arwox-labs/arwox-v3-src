@@ -1235,7 +1235,7 @@ cost_setup() {
   printf 'fixtureaccount' > "$tmp/billing.id"
   printf 0 > "$tmp/usage.rc"
   : > "$tmp/usage.hang"; : > "$tmp/usage.calls"; : > "$tmp/sent.log"; : > "$tmp/sent.config"
-  printf '%s\n' '{"currency":"RUB","expense":{"value":"10"},"entities_data":[{"resource":{"id":"alpha"},"expense":{"value":"6"}},{"resource":{"id":"beta"},"expense":{"value":"2"}},{"resource":{"id":"small"},"expense":{"value":"1"}},{"resource":{"id":"omitted"},"expense":{"value":"0.5"}},{"resource":{},"expense":{"value":"0.5"}}]}' > "$tmp/usage.json"
+  printf '%s\n' '{"currency":"RUB","expense":{"value":"10"},"entities_data":[{"resource":{"id":"alpha"},"expense":{"value":"6"}},{"resource":{"id":"beta"},"expense":{"value":"2"}},{"resource":{"id":"small"},"expense":{"value":"1"}},{"resource":{"id":"omitted"},"expense":{"value":"0.5"}},{"resource":{},"expense":{"value":"0.5"}}]}' | jq '.entities_data |= map(. + {periodic:[{timestamp:"1969-12-31T21:00:00Z"}]})' > "$tmp/usage.json"
 }
 
 case69() { # Measured totals, unassigned costs, remainder, day and throttling.
@@ -1245,12 +1245,16 @@ case69() { # Measured totals, unassigned costs, remainder, day and throttling.
     grep -q 'alpha: 6 RUB.*beta: 2 RUB.*small: 1 RUB' "$tmp/sent.log" &&
     grep -q 'Без ресурса: 0.5 RUB.*Остальное: 0.5 RUB' "$tmp/sent.log" &&
     [ "$(wc -l < "$tmp/usage.calls")" = 1 ] &&
-    grep -q -- '--retry 0.*--start-date 1970-01-01T00:00:00+03:00.*--end-date 1970-01-01T23:59:59+03:00' "$tmp/usage.calls"
+    grep -q -- '--retry 0.*--start-date 1970-01-01T00:00:00+03:00.*--end-date 1970-01-01T23:59:59+03:00' "$tmp/usage.calls" || return 1
+  printf '78000\n' > "$tmp/clock"
+  printf '{}\n' > "$tmp/state/state.json"
+  run_guard
+  tail -n 1 "$tmp/usage.calls" | grep -q -- '--start-date 1970-01-01T00:00:00+03:00.*--end-date 1970-01-01T23:59:59+03:00'
 }
 
 case70() { # Failure modes retain the base warning; the timeout is real.
   local scenario
-  for scenario in denied malformed empty currency amount mismatch timeout; do
+  for scenario in denied malformed empty currency amount mismatch period missing_period timeout; do
     cost_setup
     case "$scenario" in
       denied) printf 7 > "$tmp/usage.rc" ;;
@@ -1259,6 +1263,8 @@ case70() { # Failure modes retain the base warning; the timeout is real.
       currency) jq '.currency="RUB\nurl=bad"' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
       amount) jq '.expense.value="NaN"' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
       mismatch) jq '.expense.value="20"' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
+      period) jq '.entities_data[0].periodic += [{timestamp:"1970-01-01T21:00:00Z"}]' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
+      missing_period) jq 'del(.entities_data[0].periodic)' "$tmp/usage.json" > "$tmp/changed.json"; cp "$tmp/changed.json" "$tmp/usage.json" ;;
       timeout) printf 1 > "$tmp/usage.hang" ;;
     esac
     GUARD_YC_TIMEOUT=1 run_guard
