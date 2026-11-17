@@ -67,7 +67,7 @@ notify() { # type text
   fi
   case "$type" in
     gw_resumed) msg="✅ $GUARD_FQDN: шлюз форм был остановлен (реапер YC) — поднят сторожем, форма отвечает <$text>." ;;
-    low_balance) msg="💸 Баланс Yandex Cloud $text ₽ (< $GUARD_BALANCE_MIN). Пополнить, иначе реапер остановит шлюз форм." ;;
+    low_balance) printf -v msg '💸 Yandex Cloud\nБаланс Yandex Cloud: %.2f ₽\nПорог: %s ₽\n\n⚠️ Пополнить, иначе реапер остановит шлюз форм.' "$text" "$GUARD_BALANCE_MIN" ;;
     captcha_unverified) msg="⚠️ Заявок без проверки капчи за час: $text (> $GUARD_CAPTCHA_UNVERIFIED_MAX). Проверьте лиды [captcha-unverified] в Bitrix24." ;;
     reserve_lead) msg="📥 Заявок в резерве (Bitrix24 не принял): $text. Ключи в бакете $GUARD_RESERVE_BUCKET/reserve/." ;;
     cloud_read_failed) msg="⚠️ Яндекс-журнал функции не читается $text раз подряд — счётчик заявок без капчи видит только резерв." ;;
@@ -157,17 +157,22 @@ notify() { # type text
            ($rows | map(select(.id == ""))))
         | map(. + {cents:(.value * 100 | round)}) as $shown
         | ($total * 100 | round) as $cents
-        | "Расходы за \($day) (МСК, предварительно): \($cents / 100) \($currency); " +
-          ($shown | map("\(if .id == "" then "Без ресурса" else (.id | gsub("[[:cntrl:]\"\\\\]"; " ") | .[:80]) end): \(.cents / 100) \($currency)") | join("; ")) +
-          "; Остальное: \(($cents - ($shown | map(.cents) | add // 0)) / 100) \($currency)"
+        | "Расходы за \($day) (МСК, предварительно)\nВсего: \($cents / 100) \($currency)\n\n" +
+          ($shown | map("• \(if .id == "" then "Без ресурса" else (.id | gsub("[[:cntrl:]\"\\\\]"; " ") | .[:80]) end): \(.cents / 100) \($currency)") | join("\n")) +
+          "\n• Остальное: \(($cents - ($shown | map(.cents) | add // 0)) / 100) \($currency)"
       ' 2>/dev/null) || detail=""
     fi
-    msg="$msg ${detail:-Детализация расходов недоступна.}"
-    msg=$(printf '%s' "$msg" | jq -Rrs 'gsub("[[:cntrl:]\"\\\\]"; " ") | .[:1800]')
+    msg=$(printf '%s\n\n%s' "$msg" "${detail:-Детализация расходов недоступна.}" | jq -Rrs '
+      split("\n") | to_entries | map(
+        (.value | gsub("(?<c>[_*\\[\\]()~`>#+=|{}.!\\\\-])"; "\\\(.c)")) as $line
+        | if .key < 2 or (.value | startswith("Расходы за ") or startswith("Всего:"))
+          then "*\($line)*" else $line end) | join("\n")')
   fi
   if [ -f "$GUARD_DRILL_STATE" ]; then msg="УЧЕНИЯ: $msg"; fi
-  if out=$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata = "chat_id=%s"\ndata-urlencode = "text=%s"\n' \
-      "$TG_BOT_TOKEN" "$TG_CHAT_ID" "$msg" | curl -s --max-time 10 -K - 2>&1) && \
+  if [ "$type" = low_balance ]; then msg=$(printf '%s' "$msg" | jq -Rrs '@json | .[1:-1]'); fi
+  if out=$({ printf 'url = "https://api.telegram.org/bot%s/sendMessage"\ndata = "chat_id=%s"\n' "$TG_BOT_TOKEN" "$TG_CHAT_ID"
+      if [ "$type" = low_balance ]; then printf 'data = "parse_mode=MarkdownV2"\n'; fi
+      printf 'data-urlencode = "text=%s"\n' "$msg"; } | curl -s --max-time 10 -K - 2>&1) && \
      printf '%s' "$out" | jq -e '.ok == true' >/dev/null 2>&1; then
     case "$type" in
       form_error|gw_failed)
@@ -180,6 +185,7 @@ notify() { # type text
     esac
     log "sent $type"
     if [ "$type" = low_balance ]; then log "balance detail: ${detail:-unavailable}"; fi
+    if [ "$type" = low_balance ]; then log "balance format: $(printf '%s' "$out" | jq -r '"bold=\([.result.entities[]? | select(.type == "bold")] | length) lines=\((.result.text // "") | split("\n") | length)"')"; fi
   else
     log "send failed $type"
   fi
