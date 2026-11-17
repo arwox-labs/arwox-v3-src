@@ -116,6 +116,9 @@ case "$url" in
     printf '%s' "$status"
     ;;
   *sendMessage*)
+    if grep -Fq 'data = "parse_mode=MarkdownV2"' <<< "$config"; then
+      text=$(printf '"%s"' "$text" | jq -r .) || exit 90
+    fi
     printf '%s' "$config" >> "$GUARD_TEST_TMP/sent.config"
     printf '%s\n' "$text" >> "$GUARD_TEST_TMP/sent.log"
     printf '{"ok":true}\n'
@@ -1241,9 +1244,16 @@ cost_setup() {
 case69() { # Measured totals, unassigned costs, remainder, day and throttling.
   cost_setup
   run_guard; run_guard
-  grep -q '1970-01-01.*МСК.*10 RUB' "$tmp/sent.log" &&
-    grep -q 'alpha: 6 RUB.*beta: 2 RUB.*small: 1 RUB' "$tmp/sent.log" &&
-    grep -q 'Без ресурса: 0.5 RUB.*Остальное: 0.5 RUB' "$tmp/sent.log" &&
+  grep -Fxq '*💸 Yandex Cloud*' "$tmp/sent.log" &&
+    grep -Fxq '*Баланс Yandex Cloud: 5\.10 ₽*' "$tmp/sent.log" &&
+    grep -Fxq '*Расходы за 1970\-01\-01 \(МСК, предварительно\)*' "$tmp/sent.log" &&
+    grep -Fxq '*Всего: 10 RUB*' "$tmp/sent.log" &&
+    grep -Fxq '• alpha: 6 RUB' "$tmp/sent.log" &&
+    grep -Fxq '• beta: 2 RUB' "$tmp/sent.log" &&
+    grep -Fxq '• small: 1 RUB' "$tmp/sent.log" &&
+    grep -Fxq '• Без ресурса: 0\.5 RUB' "$tmp/sent.log" &&
+    grep -Fxq '• Остальное: 0\.5 RUB' "$tmp/sent.log" &&
+    grep -Fxq 'data = "parse_mode=MarkdownV2"' "$tmp/sent.config" &&
     [ "$(wc -l < "$tmp/usage.calls")" = 1 ] &&
     grep -q -- '--retry 0.*--start-date 1970-01-01T00:00:00+03:00.*--end-date 1970-01-01T23:59:59+03:00' "$tmp/usage.calls" || return 1
   printf '78000\n' > "$tmp/clock"
@@ -1268,7 +1278,8 @@ case70() { # Failure modes retain the base warning; the timeout is real.
       timeout) printf 1 > "$tmp/usage.hang" ;;
     esac
     GUARD_YC_TIMEOUT=1 run_guard
-    grep -q 'Баланс Yandex Cloud.*Детализация расходов недоступна' "$tmp/sent.log" || return 1
+    grep -q 'Баланс Yandex Cloud' "$tmp/sent.log" &&
+      grep -Fxq 'Детализация расходов недоступна\.' "$tmp/sent.log" || return 1
   done
 }
 
@@ -1283,14 +1294,14 @@ case71() { # Missing account and disabled Telegram never request usage.
 
 case72() { # Currency is preserved; hostile identifiers cannot inject curl configuration.
   cost_setup
-  jq '.currency="USD" | .entities_data[0].resource.id=(("evil\"\\\nurl = bad" * 200))' "$tmp/usage.json" > "$tmp/changed.json"
+  jq '.currency="USD" | .entities_data[0].resource.id=(("evil_*[x](url)\"\\\nurl = bad" * 200))' "$tmp/usage.json" > "$tmp/changed.json"
   cp "$tmp/changed.json" "$tmp/usage.json"
   run_guard
   grep -q '10 USD' "$tmp/sent.log" && ! grep -q '10 RUB' "$tmp/sent.log" &&
     [ "$(grep -c '^url = ' "$tmp/sent.config")" = 1 ] &&
     [ "$(grep -c '^data-urlencode = ' "$tmp/sent.config")" = 1 ] &&
     [ "$(wc -m < "$tmp/sent.log")" -lt 1801 ] &&
-    ! grep -Fq '\' "$tmp/sent.log" && ! grep -Fq '"' "$tmp/sent.log"
+    grep -Fq 'evil\_\*\[x\]\(url\)' "$tmp/sent.log" && ! grep -Fq '"' "$tmp/sent.log"
 }
 
 cases=("$@"); [ "${#cases[@]}" -gt 0 ] || cases=({1..72})
